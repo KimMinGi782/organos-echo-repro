@@ -1,4 +1,4 @@
-# organos-echo-repro
+# rag-retrieval-compression-benchmark -repro
 Reproducible benchmark for OrganOS Echo candidate compression on BEIR datasets.
 # OrganOS Echo
 
