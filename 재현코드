@@ -1,0 +1,285 @@
+# ============================================================
+# ORGANOS ECHO PUBLIC REPRODUCIBLE BENCHMARK v1.0
+# Real BEIR Benchmark
+#
+# Datasets:
+# - SciFact
+# - NFCorpus
+# - FIQA
+# - TREC-COVID
+#
+# Compare:
+# 1) BM25_FULL
+# 2) ORGANOS_ECHO Branch=512 / Depth=12 / Width=1
+#
+# Outputs:
+# Recall@10, nDCG@10, Avg Active, Compression
+# ============================================================
+
+!pip -q install beir rank-bm25 pandas numpy tqdm
+
+import time
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+from rank_bm25 import BM25Okapi
+from beir import util
+from beir.datasets.data_loader import GenericDataLoader
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+DATASETS = ["scifact", "nfcorpus", "fiqa", "trec-covid"]
+
+BRANCH = 512
+DEPTH = 12
+WIDTH = 1
+TOP_K = 128
+EVAL_K = 10
+
+BASE_PATH = "/kaggle/working/datasets"
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def recall_at_k(ranked_idx, rel_doc_ids, idx_to_doc_id, k=10):
+    ranked_doc_ids = [idx_to_doc_id[i] for i in ranked_idx[:k]]
+    return len(set(ranked_doc_ids) & set(rel_doc_ids)) / max(1, len(rel_doc_ids))
+
+def ndcg_at_k(ranked_idx, rel_doc_ids, idx_to_doc_id, k=10):
+    rel = set(rel_doc_ids)
+    dcg = 0.0
+
+    for rank, idx in enumerate(ranked_idx[:k]):
+        did = idx_to_doc_id[idx]
+        if did in rel:
+            dcg += 1.0 / np.log2(rank + 2)
+
+    ideal_hits = min(k, len(rel))
+    ideal = sum(1.0 / np.log2(i + 2) for i in range(ideal_hits))
+
+    return dcg / ideal if ideal > 0 else 0.0
+
+# ============================================================
+# ORGANOS ECHO PUBLIC COMPRESSION LAYER
+# ============================================================
+
+def organos_echo_scores(scores, branch=512, depth=12, width=1):
+    current = np.argsort(scores)[::-1]
+
+    echo_pools = {r: [] for r in range(2, depth + 1)}
+    stages = 0
+
+    while len(current) > TOP_K:
+        stages += 1
+        winners = []
+
+        for i in range(0, len(current), branch):
+            block = current[i:i + branch]
+
+            if len(block) == 0:
+                continue
+
+            order = np.argsort(scores[block])[::-1]
+
+            winners.append(block[order[0]])
+
+            for r in range(2, depth + 1):
+                if len(order) >= r:
+                    echo_pools[r].append(block[order[r - 1]])
+
+        current = np.array(winners, dtype=np.int64)
+
+    selected = [current]
+
+    for r in range(2, depth + 1):
+        pool = np.array(echo_pools[r], dtype=np.int64)
+
+        if len(pool) > 0:
+            echo_top = pool[np.argsort(scores[pool])[::-1][:width]]
+            selected.append(echo_top)
+
+    merged = np.concatenate(selected)
+
+    final = merged[np.argsort(scores[merged])[::-1]][:TOP_K]
+
+    active = len(merged)
+    main = len(current)
+
+    return final, active, main, stages
+
+# ============================================================
+# RUN BENCHMARK
+# ============================================================
+
+all_rows = []
+
+for DATASET in DATASETS:
+    print("=" * 120)
+    print("DATASET:", DATASET)
+    print("=" * 120)
+
+    url = (
+        "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/"
+        + DATASET +
+        ".zip"
+    )
+
+    data_path = util.download_and_unzip(url, BASE_PATH)
+
+    corpus, queries, qrels = GenericDataLoader(
+        data_folder=data_path
+    ).load(split="test")
+
+    doc_ids = list(corpus.keys())
+    idx_to_doc_id = {i: did for i, did in enumerate(doc_ids)}
+
+    corpus_texts = [
+        corpus[d].get("title", "") + " " + corpus[d].get("text", "")
+        for d in doc_ids
+    ]
+
+    tokenized_docs = [x.lower().split() for x in corpus_texts]
+
+    query_items = [
+        (qid, qtext)
+        for qid, qtext in queries.items()
+        if qid in qrels
+    ]
+
+    print("corpus :", len(corpus))
+    print("queries:", len(query_items))
+    print("qrels  :", len(qrels))
+
+    bm25 = BM25Okapi(tokenized_docs)
+    print("BM25 READY")
+
+    methods = {
+        "BM25_FULL": {
+            "recall": [],
+            "ndcg": [],
+            "active": [],
+            "main": [],
+            "stages": [],
+            "lat": []
+        },
+        "ORGANOS_ECHO": {
+            "recall": [],
+            "ndcg": [],
+            "active": [],
+            "main": [],
+            "stages": [],
+            "lat": []
+        }
+    }
+
+    for qid, qtext in tqdm(query_items):
+        rel_doc_ids = list(qrels[qid].keys())
+
+        scores = bm25.get_scores(qtext.lower().split()).astype(np.float32)
+
+        # BM25 FULL
+        start = time.time()
+
+        bm25_ranked = np.argsort(scores)[::-1][:TOP_K]
+
+        methods["BM25_FULL"]["lat"].append(time.time() - start)
+        methods["BM25_FULL"]["recall"].append(
+            recall_at_k(bm25_ranked, rel_doc_ids, idx_to_doc_id, EVAL_K)
+        )
+        methods["BM25_FULL"]["ndcg"].append(
+            ndcg_at_k(bm25_ranked, rel_doc_ids, idx_to_doc_id, EVAL_K)
+        )
+        methods["BM25_FULL"]["active"].append(len(corpus))
+        methods["BM25_FULL"]["main"].append(len(corpus))
+        methods["BM25_FULL"]["stages"].append(0)
+
+        # ORGANOS ECHO
+        start = time.time()
+
+        org_ranked, active, main, stages = organos_echo_scores(
+            scores,
+            branch=BRANCH,
+            depth=DEPTH,
+            width=WIDTH
+        )
+
+        methods["ORGANOS_ECHO"]["lat"].append(time.time() - start)
+        methods["ORGANOS_ECHO"]["recall"].append(
+            recall_at_k(org_ranked, rel_doc_ids, idx_to_doc_id, EVAL_K)
+        )
+        methods["ORGANOS_ECHO"]["ndcg"].append(
+            ndcg_at_k(org_ranked, rel_doc_ids, idx_to_doc_id, EVAL_K)
+        )
+        methods["ORGANOS_ECHO"]["active"].append(active)
+        methods["ORGANOS_ECHO"]["main"].append(main)
+        methods["ORGANOS_ECHO"]["stages"].append(stages)
+
+    for name, m in methods.items():
+        active = float(np.mean(m["active"]))
+
+        all_rows.append({
+            "dataset": DATASET,
+            "method": name,
+            "branch": BRANCH if name == "ORGANOS_ECHO" else "-",
+            "depth": DEPTH if name == "ORGANOS_ECHO" else "-",
+            "width": WIDTH if name == "ORGANOS_ECHO" else "-",
+            "Recall@10": round(float(np.mean(m["recall"])), 4),
+            "nDCG@10": round(float(np.mean(m["ndcg"])), 4),
+            "Avg Active": round(active, 2),
+            "Avg Main": round(float(np.mean(m["main"])), 2),
+            "Avg Stages": round(float(np.mean(m["stages"])), 2),
+            "Compression": round(len(corpus) / active, 2),
+            "Latency": round(float(np.sum(m["lat"])), 3)
+        })
+
+# ============================================================
+# REPORT
+# ============================================================
+
+df = pd.DataFrame(all_rows)
+
+baseline_map = {}
+
+for dataset in DATASETS:
+    base = df[
+        (df["dataset"] == dataset) &
+        (df["method"] == "BM25_FULL")
+    ].iloc[0]
+
+    baseline_map[dataset] = {
+        "recall": base["Recall@10"],
+        "ndcg": base["nDCG@10"]
+    }
+
+df["Recall Gap"] = df.apply(
+    lambda r: round(baseline_map[r["dataset"]]["recall"] - r["Recall@10"], 5),
+    axis=1
+)
+
+df["nDCG Gap"] = df.apply(
+    lambda r: round(baseline_map[r["dataset"]]["ndcg"] - r["nDCG@10"], 5),
+    axis=1
+)
+
+print()
+print("=" * 120)
+print("ORGANOS REAL BEIR BRANCH-512 MULTI DATASET RESULTS")
+print("=" * 120)
+print(df)
+print("=" * 120)
+
+print()
+print("ORGANOS ONLY")
+print(df[df["method"] == "ORGANOS_ECHO"].sort_values("Compression"))
+
+out_path = "/kaggle/working/organos_real_beir_branch512_multi.csv"
+df.to_csv(out_path, index=False)
+
+print()
+print("Saved:")
+print(out_path)
+print()
+print("DONE")
